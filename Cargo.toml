@@ -1,0 +1,10 @@
+[package]
+name = "audio-sharing-pc"
+version = "0.1.0"
+authors = ["Anton Rapetov <willir29@yandex.ru>"]
+
+[dependencies]
+portaudio = ">=0.3.1"
+hound = ">=3.4"
+crossbeam-channel = ">=0.3"
+signal-hook = ">=0.1.5"
