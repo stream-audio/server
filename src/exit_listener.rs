@@ -1,8 +1,7 @@
-extern crate signal_hook;
-
-use super::error::*;
-use channel;
+use crate::channel;
 use std::thread;
+
+use crate::error::*;
 
 pub enum SignalType {
     Exit,

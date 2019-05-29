@@ -1,7 +1,5 @@
 #[macro_use(select)]
 extern crate crossbeam_channel as channel;
-extern crate hound;
-extern crate portaudio;
 
 use portaudio as pa;
 use portaudio::PortAudio;
@@ -10,7 +8,7 @@ pub mod audio_saver;
 pub mod error;
 mod exit_listener;
 
-use error::*;
+use crate::error::*;
 
 const SAMPLE_RATE: f64 = 44_100.0;
 const CHANNELS: i32 = 1;

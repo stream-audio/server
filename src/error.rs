@@ -1,11 +1,10 @@
-use portaudio;
-
-use channel;
-
 use std::error::Error as StdError;
 use std::io;
 
-use audio_saver;
+use crate::channel;
+use portaudio;
+
+use crate::audio_saver;
 
 #[derive(Debug)]
 pub struct Error {

@@ -2,6 +2,8 @@
 name = "audio-sharing-pc"
 version = "0.1.0"
 authors = ["Anton Rapetov <willir29@yandex.ru>"]
+edition = "2018"
+
 
 [dependencies]
 portaudio = ">=0.3.1"
