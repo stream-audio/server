@@ -1,7 +1,6 @@
 use crate::channel;
-use std::thread;
-
 use crate::error::*;
+use std::thread;
 
 pub enum SignalType {
     Exit,

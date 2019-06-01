@@ -1,0 +1,561 @@
+use crate::alsa_ffi;
+use crate::audio_saver;
+use crate::error::*;
+use crate::exit_listener;
+use libc::{c_int, c_uint, c_void};
+use std::ffi;
+use std::ptr;
+
+#[derive(Debug)]
+pub struct AlsaError {
+    errnum: i32,
+    description: String,
+    context: String,
+}
+
+macro_rules! try_snd {
+    ($e:expr) => {{
+        let err = $e;
+        if err < 0 {
+            return Err(AlsaError::new(err as i32).into());
+        }
+        err
+    }};
+}
+
+impl AlsaError {
+    fn new(errnum: i32) -> Self {
+        Self {
+            errnum,
+            description: snd_strerror(errnum),
+            context: String::default(),
+        }
+    }
+}
+
+impl std::fmt::Display for AlsaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        write!(
+            f,
+            "Error Id:{}. Description: {}",
+            self.errnum, self.description
+        )?;
+        if !self.context.is_empty() {
+            write!(f, ". In context: {}", self.context)?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for AlsaError {}
+
+pub fn record(name: String, params: Params) -> Result<(), Error> {
+    let pcm = SndPcm::open(name, Stream::Capture, params)?;
+
+    println!("Opened '{}'", pcm.info()?.get_id());
+
+    let on_exit_receiver = exit_listener::listen_on_exit()?;
+
+    let mut buffer = Vec::new();
+    buffer.resize(1024, 0);
+
+    let fname = "/tmp/audio.dump";
+    let writer_settings = audio_saver::Settings {
+        channels: params.channels as u16,
+        sample_rate: params.rate as f64,
+        output: audio_saver::OutputType::File(fname.to_owned()),
+    };
+
+    let mut writer =
+        audio_saver::create_factory(audio_saver::AudioType::Wav)?.create_writer(writer_settings)?;
+
+    loop {
+        if on_exit_receiver.try_recv().is_ok() {
+            break;
+        }
+
+        let read = pcm.read_interleaved(buffer.as_mut_slice())?;
+
+        writer.write_bytes_slice(buffer.as_slice())?;
+    }
+
+    pcm.stop()?;
+
+    Ok(())
+}
+
+pub fn list_devices() -> Result<(), Error> {
+    for ctl in SndCtl::list_cards() {
+        let ctl = ctl?;
+        let info = ctl.card_info()?;
+
+        for dev_info in ctl.list_devices_info() {
+            let dev_info = dev_info?;
+
+            println!(
+                "Card: #{}, {} [{}]. Device: #{}, {}, [{}]. Subdevices qty: {}",
+                ctl.get_card_num(),
+                info.get_id(),
+                info.get_name(),
+                dev_info.get_dev_num(),
+                dev_info.get_id(),
+                dev_info.get_name(),
+                dev_info.get_subdevice_count(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub struct Params {
+    pub format: Format,
+    pub channels: u32,
+    pub rate: u32,
+}
+
+#[derive(Clone, Copy)]
+pub enum Format {
+    U8,
+    S16Le,
+    FloatLe,
+}
+
+#[derive(Clone, Copy)]
+pub enum Stream {
+    Playback,
+    Capture,
+}
+
+pub struct SndPcm {
+    raw_ptr: *mut alsa_ffi::snd_pcm_t,
+    params: Params,
+}
+impl SndPcm {
+    pub fn open(name: String, stream: Stream, params: Params) -> Result<Self, Error> {
+        unsafe {
+            let mut res: *mut alsa_ffi::snd_pcm_t = ptr::null_mut();
+
+            let name = ffi::CString::new(name)?;
+
+            try_snd!(alsa_ffi::snd_pcm_open(
+                &mut res,
+                name.as_ptr(),
+                stream.to_ffi(),
+                0
+            ));
+
+            let res = Self {
+                raw_ptr: res,
+                params,
+            };
+
+            let mut hw_params = SndPcmHwParams::new()?;
+            hw_params.set_any(&res)?;
+            hw_params.set_interleaved(&res)?;
+            hw_params.set_format(&res, params.format)?;
+            hw_params.set_channels(&res, params.channels)?;
+            hw_params.set_rate_near(&res, params.rate)?;
+
+            res.set_hw_params(&hw_params)?;
+
+            Ok(res)
+        }
+    }
+
+    pub fn info(&self) -> Result<SndPcmInfo, Error> {
+        let res = SndPcmInfo::new()?;
+        unsafe {
+            try_snd!(alsa_ffi::snd_pcm_info(self.raw_ptr, res.raw_ptr));
+        }
+        Ok(res)
+    }
+
+    pub fn read_interleaved(&self, buffer: &mut [u8]) -> Result<(usize), Error> {
+        let mut bytes_to_read = buffer.len();
+
+        while bytes_to_read > 0 {
+            let frames_to_read = self.bytes_qty_to_frames_qty(bytes_to_read);
+
+            let total_bytes_read = buffer.len() - bytes_to_read;
+            let left_buffer = &mut buffer[total_bytes_read..];
+
+            let res = unsafe {
+                try_snd!(alsa_ffi::snd_pcm_readi(
+                    self.raw_ptr,
+                    left_buffer.as_mut_ptr() as *mut c_void,
+                    frames_to_read,
+                ))
+            };
+
+            if res == -alsa_ffi::EAGAIN as alsa_ffi::snd_pcm_sframes_t {
+                self.wait_for_data(100)?;
+                continue;
+            }
+
+            let bytes_read = self.frames_qty_to_bytes_qty(res);
+
+            bytes_to_read -= bytes_read;
+
+            if bytes_to_read > 0 {
+                self.wait_for_data(100)?;
+            }
+        }
+
+        Ok(buffer.len())
+    }
+
+    /// Stops a PCM preserving pending frames.
+    pub fn stop(&self) -> Result<(), Error> {
+        unsafe {
+            try_snd!(alsa_ffi::snd_pcm_drain(self.raw_ptr));
+        }
+        Ok(())
+    }
+
+    fn set_hw_params(&self, hw_params: &SndPcmHwParams) -> Result<(), Error> {
+        unsafe {
+            try_snd!(alsa_ffi::snd_pcm_hw_params(self.raw_ptr, hw_params.raw_ptr));
+        }
+        Ok(())
+    }
+
+    fn bytes_per_frame(&self) -> usize {
+        self.params.format.bytes_per_sample() * self.params.channels as usize
+    }
+
+    fn bytes_qty_to_frames_qty(&self, bytes_qty: usize) -> alsa_ffi::snd_pcm_uframes_t {
+        (bytes_qty / self.bytes_per_frame()) as alsa_ffi::snd_pcm_uframes_t
+    }
+
+    fn frames_qty_to_bytes_qty(&self, frames_qty: alsa_ffi::snd_pcm_sframes_t) -> usize {
+        (frames_qty as usize * self.bytes_per_frame())
+    }
+
+    fn wait_for_data(&self, timeout: i32) -> Result<(), Error> {
+        unsafe {
+            try_snd!(alsa_ffi::snd_pcm_wait(self.raw_ptr, timeout as c_int));
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for SndPcm {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.raw_ptr.is_null() {
+                alsa_ffi::snd_pcm_drain(self.raw_ptr);
+                alsa_ffi::snd_pcm_close(self.raw_ptr);
+            }
+        }
+    }
+}
+
+impl Stream {
+    fn to_ffi(&self) -> alsa_ffi::snd_pcm_stream_t {
+        match self {
+            Stream::Playback => alsa_ffi::SND_PCM_STREAM_PLAYBACK,
+            Stream::Capture => alsa_ffi::SND_PCM_STREAM_CAPTURE,
+        }
+    }
+}
+
+impl Format {
+    fn to_ffi(&self) -> alsa_ffi::snd_pcm_format_t {
+        match self {
+            Format::U8 => alsa_ffi::SND_PCM_FORMAT_U8,
+            Format::S16Le => alsa_ffi::SND_PCM_FORMAT_S16_LE,
+            Format::FloatLe => alsa_ffi::SND_PCM_FORMAT_FLOAT_LE,
+        }
+    }
+
+    fn bytes_per_sample(&self) -> usize {
+        match self {
+            Format::U8 => 1,
+            Format::S16Le => 2,
+            Format::FloatLe => 4,
+        }
+    }
+}
+
+pub struct SndCtl {
+    raw_ptr: *mut alsa_ffi::snd_ctl_t,
+    card: i32,
+}
+impl SndCtl {
+    pub fn open(card: i32) -> Result<Self, Error> {
+        unsafe {
+            let mut raw_ptr: *mut alsa_ffi::snd_ctl_t = ptr::null_mut();
+
+            let name = format!("hw:{}", card);
+            let name = ffi::CString::new(name)?;
+
+            try_snd!(alsa_ffi::snd_ctl_open(
+                &mut raw_ptr,
+                name.as_ptr(),
+                0 as c_int
+            ));
+
+            Ok(Self { raw_ptr, card })
+        }
+    }
+
+    pub fn list_cards() -> SndCtlIterator {
+        SndCtlIterator { card: 0 }
+    }
+
+    pub fn get_card_num(&self) -> i32 {
+        self.card
+    }
+
+    pub fn card_info(&self) -> Result<SndCtlCardInfo, Error> {
+        let info = SndCtlCardInfo::new()?;
+        unsafe {
+            try_snd!(alsa_ffi::snd_ctl_card_info(self.raw_ptr, info.raw_ptr));
+        }
+        Ok(info)
+    }
+
+    pub fn list_devices_info(&self) -> SndDeviceInfoIterator {
+        SndDeviceInfoIterator {
+            dev: -1,
+            raw_ctl: self.raw_ptr,
+        }
+    }
+}
+impl Drop for SndCtl {
+    fn drop(&mut self) {
+        unsafe {
+            alsa_ffi::snd_ctl_close(self.raw_ptr);
+        }
+    }
+}
+
+pub struct SndCtlIterator {
+    card: c_int,
+}
+impl Iterator for SndCtlIterator {
+    type Item = Result<SndCtl, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let err = unsafe { alsa_ffi::snd_card_next(&mut self.card) };
+        if err < 0 || self.card < 0 {
+            return None;
+        }
+
+        Some(SndCtl::open(self.card))
+    }
+}
+
+pub struct SndDeviceInfoIterator {
+    dev: c_int,
+    raw_ctl: *mut alsa_ffi::snd_ctl_t,
+}
+impl Iterator for SndDeviceInfoIterator {
+    type Item = Result<SndPcmInfo, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let err = unsafe { alsa_ffi::snd_ctl_pcm_next_device(self.raw_ctl, &mut self.dev) };
+            if err < 0 || self.dev < 0 {
+                return None;
+            }
+
+            let res = SndPcmInfo::open_device(self.dev, self.raw_ctl);
+
+            if let Err(ref err) = res {
+                if let ErrorRepr::Alsa(ref err) = *err.repr {
+                    if err.errnum == -2 {
+                        continue;
+                    }
+                }
+            }
+
+            return Some(res);
+        }
+    }
+}
+
+pub struct SndPcmInfo {
+    raw_ptr: *mut alsa_ffi::snd_pcm_info_t,
+}
+impl SndPcmInfo {
+    fn new() -> Result<Self, Error> {
+        let mut res: *mut alsa_ffi::snd_pcm_info_t = ptr::null_mut();
+
+        unsafe {
+            try_snd!(alsa_ffi::snd_pcm_info_malloc(&mut res));
+        }
+        Ok(Self { raw_ptr: res })
+    }
+
+    fn open_device(dev: c_int, raw_ctl: *mut alsa_ffi::snd_ctl_t) -> Result<Self, Error> {
+        unsafe {
+            let res = Self::new()?;
+
+            alsa_ffi::snd_pcm_info_set_device(res.raw_ptr, dev as c_uint);
+            alsa_ffi::snd_pcm_info_set_subdevice(res.raw_ptr, 0);
+            alsa_ffi::snd_pcm_info_set_stream(res.raw_ptr, alsa_ffi::SND_PCM_STREAM_CAPTURE);
+
+            try_snd!(alsa_ffi::snd_ctl_pcm_info(raw_ctl, res.raw_ptr));
+            Ok(res)
+        }
+    }
+
+    pub fn get_dev_num(&self) -> i32 {
+        unsafe { alsa_ffi::snd_pcm_info_get_device(self.raw_ptr) as i32 }
+    }
+
+    pub fn get_id(&self) -> &'static str {
+        unsafe {
+            let res = alsa_ffi::snd_pcm_info_get_id(self.raw_ptr);
+            ffi::CStr::from_ptr(res)
+                .to_str()
+                .expect("Wrong UTF8 sequence")
+        }
+    }
+
+    pub fn get_name(&self) -> &'static str {
+        unsafe {
+            let res = alsa_ffi::snd_pcm_info_get_name(self.raw_ptr);
+            ffi::CStr::from_ptr(res)
+                .to_str()
+                .expect("Wrong UTF8 sequence")
+        }
+    }
+
+    pub fn get_subdevice_count(&self) -> usize {
+        unsafe { alsa_ffi::snd_pcm_info_get_subdevices_count(self.raw_ptr) as usize }
+    }
+}
+impl Drop for SndPcmInfo {
+    fn drop(&mut self) {
+        unsafe {
+            alsa_ffi::snd_pcm_info_free(self.raw_ptr);
+        }
+    }
+}
+
+pub struct SndCtlCardInfo {
+    raw_ptr: *mut alsa_ffi::snd_ctl_card_info_t,
+}
+impl SndCtlCardInfo {
+    fn new() -> Result<Self, Error> {
+        unsafe {
+            let mut raw_ptr: *mut alsa_ffi::snd_ctl_card_info_t = std::ptr::null_mut();
+            try_snd!(alsa_ffi::snd_ctl_card_info_malloc(&mut raw_ptr));
+
+            Ok(Self { raw_ptr })
+        }
+    }
+
+    pub fn get_id(&self) -> &'static str {
+        unsafe {
+            let id = alsa_ffi::snd_ctl_card_info_get_id(self.raw_ptr);
+            ffi::CStr::from_ptr(id)
+                .to_str()
+                .expect("Wrong UTF8 sequence")
+        }
+    }
+
+    pub fn get_name(&self) -> &'static str {
+        unsafe {
+            let name = alsa_ffi::snd_ctl_card_info_get_name(self.raw_ptr);
+            ffi::CStr::from_ptr(name)
+                .to_str()
+                .expect("Wrong UTF8 sequence")
+        }
+    }
+}
+impl Drop for SndCtlCardInfo {
+    fn drop(&mut self) {
+        unsafe {
+            alsa_ffi::snd_ctl_card_info_free(self.raw_ptr);
+        }
+    }
+}
+
+struct SndPcmHwParams {
+    raw_ptr: *mut alsa_ffi::snd_pcm_hw_params_t,
+}
+
+impl SndPcmHwParams {
+    fn new() -> Result<Self, Error> {
+        let mut raw_ptr = ptr::null_mut();
+        unsafe {
+            try_snd!(alsa_ffi::snd_pcm_hw_params_malloc(&mut raw_ptr));
+        }
+
+        Ok(Self { raw_ptr })
+    }
+
+    fn set_any(&mut self, pcm: &SndPcm) -> Result<(), Error> {
+        unsafe {
+            try_snd!(alsa_ffi::snd_pcm_hw_params_any(pcm.raw_ptr, self.raw_ptr));
+        }
+        Ok(())
+    }
+
+    fn set_interleaved(&mut self, pcm: &SndPcm) -> Result<(), Error> {
+        unsafe {
+            try_snd!(alsa_ffi::snd_pcm_hw_params_set_access(
+                pcm.raw_ptr,
+                self.raw_ptr,
+                alsa_ffi::SND_PCM_ACCESS_RW_INTERLEAVED,
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_format(&mut self, pcm: &SndPcm, format: Format) -> Result<(), Error> {
+        unsafe {
+            try_snd!(alsa_ffi::snd_pcm_hw_params_set_format(
+                pcm.raw_ptr,
+                self.raw_ptr,
+                format.to_ffi(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_channels(&mut self, pcm: &SndPcm, channels: u32) -> Result<(), Error> {
+        unsafe {
+            try_snd!(alsa_ffi::snd_pcm_hw_params_set_channels(
+                pcm.raw_ptr,
+                self.raw_ptr,
+                channels as c_uint,
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_rate_near(&mut self, pcm: &SndPcm, mut rate: u32) -> Result<(), Error> {
+        unsafe {
+            try_snd!(alsa_ffi::snd_pcm_hw_params_set_rate_near(
+                pcm.raw_ptr,
+                self.raw_ptr,
+                &mut rate,
+                ptr::null_mut(),
+            ));
+        }
+        Ok(())
+    }
+}
+impl Drop for SndPcmHwParams {
+    fn drop(&mut self) {
+        unsafe {
+            alsa_ffi::snd_pcm_hw_params_free(self.raw_ptr);
+        }
+    }
+}
+
+fn snd_strerror(errnum: c_int) -> String {
+    unsafe {
+        let res = alsa_ffi::snd_strerror(errnum);
+        ffi::CStr::from_ptr(res)
+            .to_str()
+            .expect("Wrong UTF8 sequence")
+            .to_owned()
+    }
+}

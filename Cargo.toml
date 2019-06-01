@@ -4,9 +4,9 @@ version = "0.1.0"
 authors = ["Anton Rapetov <willir29@yandex.ru>"]
 edition = "2018"
 
-
 [dependencies]
-portaudio = ">=0.3.1"
-hound = ">=3.4"
-crossbeam-channel = ">=0.3"
-signal-hook = ">=0.1.5"
+portaudio = "0.7"
+hound = "3.4"
+crossbeam-channel = "0.3"
+signal-hook = "0.1.5"
+libc = "0.2"
