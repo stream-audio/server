@@ -6,9 +6,9 @@ fn main() -> Result<(), Error> {
     alsa::list_devices()?;
 
     let params = alsa::Params {
-        format: alsa::Format::FloatLe,
+        format: alsa::Format::S16Le,
         channels: 2,
-        rate: 48000,
+        rate: 44100,
     };
 
     alsa::record("hw:3,1".to_owned(), params)?;

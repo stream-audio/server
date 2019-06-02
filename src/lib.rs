@@ -5,11 +5,10 @@ use crate::error::*;
 use portaudio as pa;
 
 pub mod alsa;
-#[allow(dead_code, unused_attributes, bad_style)]
-pub mod alsa_ffi;
 pub mod audio_saver;
 pub mod error;
 mod exit_listener;
+mod thread_buffer;
 
 const CHANNELS: i32 = 1;
 const FRAMES: u32 = 256; //4096; //8192;
@@ -58,122 +57,8 @@ pub fn run() -> Result<(), Error> {
         println!("Input format is supported. sample_rate: {}", sample_rate);
     }
 
-    save_input_to_file(&pa, settings)?;
+    // save_input_to_file(&pa, settings)?;
     //save_input_to_file_sync(&pa, settings)?;
 
     Ok(())
 }
-
-fn save_input_to_file(
-    pa: &pa::PortAudio,
-    pa_settings: pa::InputStreamSettings<Sample>,
-) -> Result<(), Error> {
-    let fname = "/tmp/audio.dump";
-    let writer_settings = audio_saver::Settings {
-        channels: CHANNELS as u16,
-        sample_rate: pa_settings.sample_rate,
-        output: audio_saver::OutputType::File(fname.to_owned()),
-    };
-    let writer =
-        audio_saver::create_factory(audio_saver::AudioType::Wav)?.create_writer(writer_settings)?;
-
-    let (err_sender, err_receiver) = channel::unbounded::<Error>();
-
-    let thread_writer = audio_saver::ThreadAudioWriter::new(writer);
-
-    let callback = move |args: pa::InputStreamCallbackArgs<Sample>| {
-        let r = thread_writer.write_samples_slice(args.buffer);
-        if let Err(e) = r {
-            let send_res = err_sender.send(e.into());
-            if send_res.is_err() {
-                return pa::Complete;
-            }
-        }
-        pa::Continue
-    };
-
-    let mut stream = pa.open_non_blocking_stream(pa_settings, callback)?;
-
-    let on_exit_receiver = exit_listener::listen_on_exit()?;
-
-    stream.start()?;
-
-    let mut res: Result<(), Error> = Ok(());
-
-    select! {
-        recv(on_exit_receiver) -> _ => eprintln!("On exit signal received"),
-        recv(err_receiver) -> msg => {
-            res = Err(msg?);
-        },
-    }
-
-    stream.stop()?;
-    stream.close()?;
-    res
-}
-
-/*
-fn wait_for_stream(f: impl Fn() -> Result<pa::StreamAvailable, pa::Error>) -> Result<u32, Error> {
-    loop {
-        match f()? {
-            pa::StreamAvailable::Frames(frames) => return Ok(frames as u32),
-            pa::StreamAvailable::InputOverflowed => eprintln!("Input Overflowed"),
-            pa::StreamAvailable::OutputUnderflowed => eprintln!("Output Underflowed"),
-        }
-    }
-}
-//
-//#[allow(type_alias_bounds)]
-//type Stream<F: pa::stream::Reader> = pa::Stream<pa::Blocking<F::Buffer>, F>;
-
-const FILE_BUFFER_SIZE: usize = 4 * 1024;
-
-fn save_input_to_file_sync(
-    pa: &pa::PortAudio,
-    pa_settings: pa::InputStreamSettings<Sample>,
-) -> Result<(), Error> {
-    let mut stream = pa.open_blocking_stream(pa_settings)?;
-
-    stream.start()?;
-    let mut buffer = Vec::<Sample>::new();
-
-    let fname = "/tmp/audio.dump";
-    let writer_settings = audio_saver::Settings {
-        channels: CHANNELS as u16,
-        sample_rate: pa_settings.sample_rate,
-        output: audio_saver::OutputType::File(fname.to_owned()),
-    };
-
-    let mut writer =
-        audio_saver::create_factory(audio_saver::AudioType::Wav)?.create_writer(writer_settings)?;
-
-    let on_exit_receiver = exit_listener::listen_on_exit()?;
-
-    loop {
-        let frames_num = wait_for_stream(|| stream.read_available())?;
-        if frames_num == 0 {
-            continue;
-        }
-
-        buffer.extend_from_slice(stream.read(frames_num)?);
-
-        if on_exit_receiver.try_recv().is_ok() {
-            break;
-        }
-
-        if buffer.len() >= FILE_BUFFER_SIZE {
-            writer.write_samples_slice(&buffer)?;
-            buffer.clear();
-        }
-    }
-
-    stream.stop()?;
-
-    dbg!();
-    stream.close()?;
-    dbg!();
-
-    Ok(())
-}
-
-*/

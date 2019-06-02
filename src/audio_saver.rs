@@ -1,16 +1,9 @@
-use std::cmp;
-use std::collections::VecDeque;
+use hound;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
-
-use hound;
-
-use std::thread::JoinHandle;
 
 #[derive(Debug)]
 pub struct Error {
@@ -62,27 +55,6 @@ impl fmt::Display for Error {
 }
 impl ::std::error::Error for Error {}
 
-type Sample = f32;
-
-trait SampleFormatGetter {
-    fn sample_format() -> hound::SampleFormat;
-}
-impl SampleFormatGetter for i16 {
-    fn sample_format() -> hound::SampleFormat {
-        hound::SampleFormat::Int
-    }
-}
-impl SampleFormatGetter for i32 {
-    fn sample_format() -> hound::SampleFormat {
-        hound::SampleFormat::Int
-    }
-}
-impl SampleFormatGetter for f32 {
-    fn sample_format() -> hound::SampleFormat {
-        hound::SampleFormat::Float
-    }
-}
-
 #[derive(Clone, Debug)]
 pub enum OutputType {
     File(String),
@@ -99,17 +71,23 @@ impl fmt::Display for OutputType {
 pub struct Settings {
     pub channels: u16,
     pub sample_rate: f64,
+    pub format: Format,
     pub output: OutputType,
 }
 
-pub trait AudioFactory {
-    fn create_writer(&self, settings: Settings) -> Result<Box<dyn AudioWriter + Send>, Error>;
+#[derive(Clone, Debug)]
+pub enum Format {
+    U8,
+    S16Le,
+    S32Le,
+    FloatLe,
 }
 
-pub trait AudioWriter {
-    fn write_sample(&mut self, sample: Sample) -> Result<(), Error>;
-    fn write_samples_slice(&mut self, samples: &[Sample]) -> Result<(), Error>;
-    fn write_samples_vec_deq(&mut self, samples: &VecDeque<Sample>) -> Result<(), Error>;
+pub trait AudioFactory {
+    fn create_writer(&self, settings: Settings) -> Result<Box<dyn AudioWriter>, Error>;
+}
+
+pub trait AudioWriter: Send {
     fn write_bytes_slice(&mut self, data: &[u8]) -> Result<(), Error>;
 }
 
@@ -125,191 +103,92 @@ pub fn create_factory(audio_type: AudioType) -> Result<Box<dyn AudioFactory>, Er
 
 struct WavHoundFactory {}
 
-impl AudioFactory for WavHoundFactory {
-    fn create_writer(&self, settings: Settings) -> Result<Box<dyn AudioWriter + Send>, Error> {
-        let hound_spec = hound::WavSpec {
-            channels: settings.channels,
-            sample_rate: settings.sample_rate as u32,
-            bits_per_sample: (size_of::<Sample>() * 8) as u16,
-            sample_format: Sample::sample_format(),
-        };
+impl Format {
+    fn bits_per_sample(&self) -> u16 {
+        match self {
+            Format::U8 => 8,
+            Format::S16Le => 16,
+            Format::S32Le | Format::FloatLe => 32,
+        }
+    }
 
-        let w = WavHoundWriter::create(settings.output, hound_spec)?;
-        Ok(w)
+    fn hound_format(&self) -> hound::SampleFormat {
+        match self {
+            Format::U8 | Format::S16Le | Format::S32Le => hound::SampleFormat::Int,
+            Format::FloatLe => hound::SampleFormat::Float,
+        }
+    }
+}
+
+impl AudioFactory for WavHoundFactory {
+    fn create_writer(&self, settings: Settings) -> Result<Box<dyn AudioWriter>, Error> {
+        Ok(WavHoundWriter::create(settings)?)
     }
 }
 
 struct WavHoundWriter {
     repr: hound::WavWriter<io::BufWriter<fs::File>>,
-    output: OutputType,
+    settings: Settings,
 }
 impl WavHoundWriter {
-    fn create(output: OutputType, spec: hound::WavSpec) -> Result<Box<WavHoundWriter>, Error> {
-        let repr = match &output {
-            OutputType::File(fname) => hound::WavWriter::create(Path::new(&fname), spec)
-                .map_err(|e| Error::new(e.into(), output.clone()))?,
+    fn create(settings: Settings) -> Result<Box<WavHoundWriter>, Error> {
+        let spec = hound::WavSpec {
+            channels: settings.channels,
+            sample_rate: settings.sample_rate as u32,
+            bits_per_sample: settings.format.bits_per_sample(),
+            sample_format: settings.format.hound_format(),
         };
-        Ok(Box::new(WavHoundWriter { repr, output }))
+
+        let repr = match &settings.output {
+            OutputType::File(fname) => hound::WavWriter::create(Path::new(&fname), spec)
+                .map_err(|e| Error::new(e.into(), settings.output.clone()))?,
+        };
+        Ok(Box::new(WavHoundWriter { repr, settings }))
     }
-}
-impl AudioWriter for WavHoundWriter {
-    fn write_sample(&mut self, sample: Sample) -> Result<(), Error> {
+
+    fn write_sample<S>(&mut self, sample: S) -> Result<(), Error>
+    where
+        S: hound::Sample + Copy,
+    {
         self.repr
             .write_sample(sample)
-            .map_err(|e| Error::new(e.into(), self.output.clone()))
+            .map_err(|e| Error::new(e.into(), self.settings.output.clone()))
     }
 
-    fn write_samples_slice(&mut self, samples: &[Sample]) -> Result<(), Error> {
+    fn write_samples_slice<S>(&mut self, samples: &[S]) -> Result<(), Error>
+    where
+        S: hound::Sample + Copy,
+    {
         for sample in samples {
             self.write_sample(*sample)?;
         }
         Ok(())
     }
 
-    fn write_samples_vec_deq(&mut self, samples: &VecDeque<Sample>) -> Result<(), Error> {
-        for sample in samples {
-            self.write_sample(*sample)?;
-        }
-        Ok(())
-    }
-
-    fn write_bytes_slice(&mut self, data: &[u8]) -> Result<(), Error> {
-        if data.len() % size_of::<Sample>() != 0 {
+    fn write_bytes_as_samples<S>(&mut self, data: &[u8]) -> Result<(), Error>
+    where
+        S: hound::Sample + Copy,
+    {
+        if data.len() % size_of::<S>() != 0 {
             return Err(Error::new(
                 ErrorKind::FormatError("Size of data is not multiple of sample size"),
-                self.output.clone(),
+                self.settings.output.clone(),
             ));
         }
 
         let samples = unsafe {
-            std::slice::from_raw_parts(
-                data.as_ptr() as *const Sample,
-                data.len() / size_of::<Sample>(),
-            )
+            std::slice::from_raw_parts(data.as_ptr() as *const S, data.len() / size_of::<S>())
         };
-
         self.write_samples_slice(samples)
     }
 }
-
-pub struct ThreadAudioWriter {
-    que: Arc<ThreadAudioWriterQueue>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl ThreadAudioWriter {
-    pub fn new(writer: Box<dyn AudioWriter + Send>) -> Self {
-        let que = Arc::new(ThreadAudioWriterQueue::default());
-        let mut thread_self = ThreadAudioWriterData::new(que.clone(), writer);
-
-        let thread = thread::Builder::new()
-            .name("Audio Writer".to_owned())
-            .spawn(move || thread_self.thread_loop())
-            .expect("Error creating an audio writing thread");
-
-        Self {
-            que,
-            thread: Some(thread),
+impl AudioWriter for WavHoundWriter {
+    fn write_bytes_slice(&mut self, data: &[u8]) -> Result<(), Error> {
+        match self.settings.format {
+            Format::U8 => self.write_bytes_as_samples::<i8>(data),
+            Format::S16Le => self.write_bytes_as_samples::<i16>(data),
+            Format::S32Le => self.write_bytes_as_samples::<i32>(data),
+            Format::FloatLe => self.write_bytes_as_samples::<f32>(data),
         }
-    }
-
-    pub fn write_sample(&self, sample: Sample) -> Result<(), Error> {
-        let mut que = self.que.que.lock().unwrap();
-        if let Some(que) = que.as_mut() {
-            que.push_back(sample);
-            self.que.cvar.notify_one();
-        }
-        Ok(())
-    }
-
-    pub fn write_samples_slice(&self, samples: &[Sample]) -> Result<(), Error> {
-        let mut que = self.que.que.lock().unwrap();
-        if let Some(que) = que.as_mut() {
-            que.extend(samples.iter());
-            self.que.cvar.notify_one();
-        }
-        Ok(())
-    }
-
-    pub fn stop_and_join(&mut self) {
-        dbg!("stop_and_join");
-        *self.que.que.lock().unwrap() = None;
-        self.que.cvar.notify_one();
-        self.thread.take().unwrap().join().unwrap();
-        dbg!("stop_and_join end");
-    }
-}
-impl Drop for ThreadAudioWriter {
-    fn drop(&mut self) {
-        self.stop_and_join();
-    }
-}
-
-struct ThreadAudioWriterQueue {
-    que: Mutex<Option<VecDeque<Sample>>>,
-    cvar: Condvar,
-}
-impl Default for ThreadAudioWriterQueue {
-    fn default() -> Self {
-        Self {
-            que: Mutex::new(Some(VecDeque::with_capacity(4096))),
-            cvar: Condvar::new(),
-        }
-    }
-}
-
-const BUFFER_SIZE: usize = 16384;
-struct ThreadAudioWriterData {
-    que: Arc<ThreadAudioWriterQueue>,
-    writer: Box<dyn AudioWriter + Send>,
-    buffer: Vec<Sample>,
-}
-
-impl ThreadAudioWriterData {
-    fn new(que: Arc<ThreadAudioWriterQueue>, writer: Box<dyn AudioWriter + Send>) -> Self {
-        Self {
-            que,
-            writer,
-            buffer: Vec::with_capacity(BUFFER_SIZE),
-        }
-    }
-
-    fn thread_loop(&mut self) {
-        loop {
-            let can_continue = self.wait_and_fill_buffer();
-            if !can_continue {
-                return;
-            }
-
-            let write_res = self.writer.write_samples_slice(&self.buffer);
-            if let Err(err) = write_res {
-                eprintln!("Error writing audio: {}", err);
-                return;
-            }
-            self.buffer.clear();
-        }
-    }
-
-    fn wait_and_fill_buffer(&mut self) -> bool {
-        let mut lock = self.que.que.lock().unwrap();
-
-        let que = loop {
-            if let Some(ref mut que) = *lock {
-                if !que.is_empty() {
-                    break que;
-                }
-            } else {
-                return false;
-            }
-
-            lock = self.que.cvar.wait(lock).unwrap();
-        };
-
-        let drain_len = cmp::min(que.len(), BUFFER_SIZE);
-        let drained = que.drain(..drain_len);
-
-        self.buffer.extend(drained.into_iter());
-
-        true
     }
 }

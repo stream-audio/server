@@ -1,6 +1,7 @@
 use crate::alsa;
 use crate::audio_saver;
 use crate::channel;
+use core::fmt::{Debug, Pointer};
 use portaudio;
 use std::error::Error as StdError;
 use std::io;
@@ -15,10 +16,11 @@ pub enum ErrorRepr {
     PortAudio(portaudio::Error),
     FileError(FileError),
     IoError(IoError),
+    FromUtf8(std::string::FromUtf8Error),
+    Utf8(std::str::Utf8Error),
     AudioSaverError(audio_saver::Error),
     ChannelError(&'static str),
     ChannelRecv(channel::RecvError),
-    Utf8(std::str::Utf8Error),
     Alsa(alsa::AlsaError),
     Nul(std::ffi::NulError),
 }
@@ -61,10 +63,11 @@ impl ::std::fmt::Display for Error {
             ErrorRepr::PortAudio(ref e) => write!(f, "PortAudio Error: {}", e.description()),
             ErrorRepr::FileError(ref e) => write!(f, "{} in file '{}'", e.error, e.fname),
             ErrorRepr::IoError(ref e) => write!(f, "{}. during {}", e.error, e.context),
+            ErrorRepr::FromUtf8(ref e) => write!(f, "{}", e),
+            ErrorRepr::Utf8(e) => write!(f, "From UTF8 conversion error {}", e),
             ErrorRepr::AudioSaverError(ref e) => write!(f, "{}", e),
             ErrorRepr::ChannelError(e) => write!(f, "Channel Error {}", e),
             ErrorRepr::ChannelRecv(e) => write!(f, "Channel Error {}", e),
-            ErrorRepr::Utf8(e) => write!(f, "From UTF8 conversion error {}", e),
             ErrorRepr::Alsa(ref e) => write!(f, "Alsa Error {}", e),
             ErrorRepr::Nul(ref e) => write!(f, "There is null byte in the string. {}", e),
         }
@@ -95,6 +98,11 @@ impl From<audio_saver::Error> for Error {
 impl From<channel::RecvError> for Error {
     fn from(e: channel::RecvError) -> Self {
         Self::new(ErrorRepr::ChannelRecv(e))
+    }
+}
+impl From<std::string::FromUtf8Error> for Error {
+    fn from(e: std::string::FromUtf8Error) -> Self {
+        Self::new(ErrorRepr::FromUtf8(e))
     }
 }
 impl From<std::str::Utf8Error> for Error {
