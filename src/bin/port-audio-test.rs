@@ -1,6 +1,5 @@
 use audio_sharing_pc::alsa;
 use audio_sharing_pc::error::*;
-use audio_sharing_pc::run;
 
 fn main() -> Result<(), Error> {
     alsa::list_devices()?;

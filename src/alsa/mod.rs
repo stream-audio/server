@@ -4,12 +4,14 @@ mod alsa_ffi;
 use crate::audio_saver;
 use crate::error::*;
 use crate::exit_listener;
+use crate::net_server;
 use crate::thread_buffer;
 use alsa_ffi::{snd_pcm_sframes_t, snd_pcm_uframes_t};
 use libc::{c_int, c_uint, c_void};
 use std::cmp;
 use std::ffi;
 use std::ptr;
+use std::sync::atomic::Ordering;
 
 #[derive(Debug)]
 pub struct AlsaError {
@@ -76,6 +78,9 @@ pub fn record(name: String, params: Params) -> Result<(), Error> {
     println!("Player settings: {}", pcm_player.dump_settings()?);
 
     let on_exit_receiver = exit_listener::listen_on_exit()?;
+    let on_exit_flag = on_exit_receiver.signal_flag.clone();
+
+    let server = net_server::NetServer::new("0.0.0.0:25204".parse().unwrap(), on_exit_receiver)?;
 
     let writer_settings = audio_saver::Settings {
         channels: params.channels as u16,
@@ -92,9 +97,9 @@ pub fn record(name: String, params: Params) -> Result<(), Error> {
         player: pcm_player,
     }));
 
-    let mut buffer = vec![0; 2048];
+    let mut buffer = vec![0; 1024];
     loop {
-        if on_exit_receiver.try_recv().is_ok() {
+        if on_exit_flag.load(Ordering::SeqCst) {
             eprintln!("Caught Signal, finishing job");
             break;
         }
@@ -102,6 +107,7 @@ pub fn record(name: String, params: Params) -> Result<(), Error> {
         let read = pcm_recorder.read_interleaved(buffer.as_mut_slice())?;
         //        file_writer.write_bytes_slice(&buffer[..read])?;
         //        pcm_player.write_interleaved(&buffer[..read])?;
+        server.send_to_all(&buffer[..read])?;
         thread_writer.write_data(&buffer[..read])?;
     }
 

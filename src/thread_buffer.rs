@@ -104,12 +104,15 @@ impl ThreadData {
         let mut lock = self.que.que.lock().unwrap();
 
         let que = loop {
-            if let Some(ref mut que) = *lock {
-                if !que.is_empty() {
-                    break que;
+            match *lock {
+                Some(ref mut que) => {
+                    if !que.is_empty() {
+                        break que;
+                    }
                 }
-            } else {
-                return false;
+                None => {
+                    return false;
+                }
             }
 
             lock = self.que.cvar.wait(lock).unwrap();

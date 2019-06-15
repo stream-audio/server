@@ -1,8 +1,8 @@
 use crate::alsa;
 use crate::audio_saver;
 use crate::channel;
-use core::fmt::{Debug, Pointer};
 use portaudio;
+use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::io;
 
@@ -33,7 +33,7 @@ pub struct FileError {
 
 #[derive(Debug)]
 pub struct IoError {
-    context: &'static str,
+    context: Cow<'static, str>,
     error: io::Error,
 }
 
@@ -52,8 +52,11 @@ impl FileError {
 }
 
 impl IoError {
-    pub(crate) fn new(context: &'static str, error: io::Error) -> Self {
-        Self { context, error }
+    pub(crate) fn new<S: Into<Cow<'static, str>>>(context: S, error: io::Error) -> Self {
+        Self {
+            context: context.into(),
+            error,
+        }
     }
 }
 
@@ -62,7 +65,7 @@ impl ::std::fmt::Display for Error {
         match *self.repr {
             ErrorRepr::PortAudio(ref e) => write!(f, "PortAudio Error: {}", e.description()),
             ErrorRepr::FileError(ref e) => write!(f, "{} in file '{}'", e.error, e.fname),
-            ErrorRepr::IoError(ref e) => write!(f, "{}. during {}", e.error, e.context),
+            ErrorRepr::IoError(ref e) => write!(f, "{}. During {}", e.error, e.context),
             ErrorRepr::FromUtf8(ref e) => write!(f, "{}", e),
             ErrorRepr::Utf8(e) => write!(f, "From UTF8 conversion error {}", e),
             ErrorRepr::AudioSaverError(ref e) => write!(f, "{}", e),

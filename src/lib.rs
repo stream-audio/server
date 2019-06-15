@@ -1,4 +1,3 @@
-#[macro_use(select)]
 extern crate crossbeam_channel as channel;
 
 use crate::error::*;
@@ -8,6 +7,7 @@ pub mod alsa;
 pub mod audio_saver;
 pub mod error;
 mod exit_listener;
+pub mod net_server;
 mod thread_buffer;
 
 const CHANNELS: i32 = 1;
