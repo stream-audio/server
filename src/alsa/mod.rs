@@ -540,7 +540,7 @@ impl Iterator for SndDeviceInfoIterator {
             let res = SndPcmInfo::open_device(self.dev, self.raw_ctl);
 
             if let Err(ref err) = res {
-                if let ErrorRepr::Alsa(ref err) = *err.repr {
+                if let ErrorRepr::Alsa(err) = err.get_repr() {
                     if err.errnum == -2 {
                         continue;
                     }

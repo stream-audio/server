@@ -1,19 +1,16 @@
 use crate::alsa;
 use crate::audio_saver;
 use crate::channel;
-use portaudio;
 use std::borrow::Cow;
-use std::error::Error as StdError;
 use std::io;
 
 #[derive(Debug)]
 pub struct Error {
-    pub repr: Box<ErrorRepr>,
+    repr: Box<ErrorRepr>,
 }
 
 #[derive(Debug)]
 pub enum ErrorRepr {
-    PortAudio(portaudio::Error),
     FileError(FileError),
     IoError(IoError),
     FromUtf8(std::string::FromUtf8Error),
@@ -43,6 +40,9 @@ impl Error {
             repr: Box::new(repr),
         }
     }
+    pub fn get_repr(&self) -> &ErrorRepr {
+        &self.repr
+    }
 }
 
 impl FileError {
@@ -63,7 +63,6 @@ impl IoError {
 impl ::std::fmt::Display for Error {
     fn fmt(&self, f: &mut ::std::fmt::Formatter) -> Result<(), ::std::fmt::Error> {
         match *self.repr {
-            ErrorRepr::PortAudio(ref e) => write!(f, "PortAudio Error: {}", e.description()),
             ErrorRepr::FileError(ref e) => write!(f, "{} in file '{}'", e.error, e.fname),
             ErrorRepr::IoError(ref e) => write!(f, "{}. During {}", e.error, e.context),
             ErrorRepr::FromUtf8(ref e) => write!(f, "{}", e),
@@ -78,11 +77,6 @@ impl ::std::fmt::Display for Error {
 }
 impl ::std::error::Error for Error {}
 
-impl From<portaudio::Error> for Error {
-    fn from(pa_error: portaudio::Error) -> Self {
-        Self::new(ErrorRepr::PortAudio(pa_error))
-    }
-}
 impl From<FileError> for Error {
     fn from(fe: FileError) -> Self {
         Self::new(ErrorRepr::FileError(fe))

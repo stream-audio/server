@@ -5,7 +5,6 @@ authors = ["Anton Rapetov <willir29@yandex.ru>"]
 edition = "2018"
 
 [dependencies]
-portaudio = "0.7"
 hound = "3.4"
 crossbeam-channel = "0.3"
 signal-hook = "0.1.5"
