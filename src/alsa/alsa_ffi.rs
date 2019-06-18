@@ -254,6 +254,12 @@ extern "C" {
         val: snd_pcm_uframes_t,
     ) -> c_int;
 
+    pub fn snd_pcm_hw_params_test_format(
+        pcm: *mut snd_pcm_t,
+        params: *mut snd_pcm_hw_params_t,
+        val: snd_pcm_format_t,
+    ) -> c_int;
+
     pub fn snd_pcm_status_malloc(ptr: *mut *mut snd_pcm_status_t) -> c_int;
     pub fn snd_pcm_status_free(ptr: *mut snd_pcm_status_t);
     pub fn snd_pcm_status(pcm: *mut snd_pcm_t, status: *mut snd_pcm_status_t) -> c_int;

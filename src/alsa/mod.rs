@@ -3,39 +3,43 @@ mod alsa_ffi;
 
 use crate::audio_saver;
 use crate::error::*;
-use crate::exit_listener;
-use crate::net_server;
-use crate::thread_buffer;
 use alsa_ffi::{snd_pcm_sframes_t, snd_pcm_uframes_t};
 use libc::{c_int, c_uint, c_void};
+use std::borrow::Cow;
 use std::cmp;
 use std::ffi;
 use std::ptr;
-use std::sync::atomic::Ordering;
 
 #[derive(Debug)]
 pub struct AlsaError {
     errnum: i32,
     description: String,
-    context: String,
+    context: Cow<'static, str>,
 }
 
 macro_rules! try_snd {
     ($e:expr) => {{
         let err = $e;
         if err < 0 {
-            return Err(AlsaError::new(err as i32).into());
+            return Err(AlsaError::new(err as i32, format!("calling {}", stringify!($e))).into());
+        }
+        err
+    }};
+    ($e:expr, $ctx:expr) => {{
+        let err = $e;
+        if err < 0 {
+            return Err(AlsaError::new(err as i32, $ctx).into());
         }
         err
     }};
 }
 
 impl AlsaError {
-    fn new(errnum: i32) -> Self {
+    fn new<S: Into<Cow<'static, str>>>(errnum: i32, context: S) -> Self {
         Self {
             errnum,
             description: snd_strerror(errnum),
-            context: String::default(),
+            context: context.into(),
         }
     }
 }
@@ -55,92 +59,6 @@ impl std::fmt::Display for AlsaError {
 }
 impl std::error::Error for AlsaError {}
 
-struct AudioWriter {
-    file_writer: Box<dyn audio_saver::AudioWriter>,
-    player: SndPcm,
-}
-
-impl thread_buffer::DataReceiver for AudioWriter {
-    fn new_slice(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.file_writer.write_bytes_slice(data)?;
-        self.player.write_interleaved(data)?;
-        Ok(())
-    }
-}
-
-pub fn record(name: String, params: Params) -> Result<(), Error> {
-    let pcm_recorder = SndPcm::open(name, Stream::Capture, params)?;
-    let params = pcm_recorder.params;
-    let pcm_player = SndPcm::open("default".to_owned(), Stream::Playback, params)?;
-
-    println!("Opened '{}'", pcm_recorder.info()?.get_id());
-    println!("Capture settings: {}", pcm_recorder.dump_settings()?);
-    println!("Player settings: {}", pcm_player.dump_settings()?);
-
-    let on_exit_receiver = exit_listener::listen_on_exit()?;
-    let on_exit_flag = on_exit_receiver.signal_flag.clone();
-
-    let server = net_server::NetServer::new("0.0.0.0:25204".parse().unwrap(), on_exit_receiver)?;
-
-    let writer_settings = audio_saver::Settings {
-        channels: params.channels as u16,
-        sample_rate: params.rate as f64,
-        format: params.format.to_audio_saver_format(),
-        output: audio_saver::OutputType::File("/tmp/audio.dump".to_owned()),
-    };
-
-    let file_writer =
-        audio_saver::create_factory(audio_saver::AudioType::Wav)?.create_writer(writer_settings)?;
-
-    let mut thread_writer = thread_buffer::ThreadBuffer::new(Box::new(AudioWriter {
-        file_writer,
-        player: pcm_player,
-    }));
-
-    let mut buffer = vec![0; 1024];
-    loop {
-        if on_exit_flag.load(Ordering::SeqCst) {
-            eprintln!("Caught Signal, finishing job");
-            break;
-        }
-
-        let read = pcm_recorder.read_interleaved(buffer.as_mut_slice())?;
-        //        file_writer.write_bytes_slice(&buffer[..read])?;
-        //        pcm_player.write_interleaved(&buffer[..read])?;
-        server.send_to_all(&buffer[..read])?;
-        thread_writer.write_data(&buffer[..read])?;
-    }
-
-    pcm_recorder.stop()?;
-    thread_writer.stop_and_join();
-
-    Ok(())
-}
-
-pub fn list_devices() -> Result<(), Error> {
-    for ctl in SndCtl::list_cards() {
-        let ctl = ctl?;
-        let info = ctl.card_info()?;
-
-        for dev_info in ctl.list_devices_info() {
-            let dev_info = dev_info?;
-
-            println!(
-                "Card: #{}, {} [{}]. Device: #{}, {}, [{}]. Subdevices qty: {}",
-                ctl.get_card_num(),
-                info.get_id(),
-                info.get_name(),
-                dev_info.get_dev_num(),
-                dev_info.get_id(),
-                dev_info.get_name(),
-                dev_info.get_subdevice_count(),
-            );
-        }
-    }
-
-    Ok(())
-}
-
 #[derive(Clone, Copy)]
 pub struct Params {
     pub format: Format,
@@ -148,14 +66,14 @@ pub struct Params {
     pub rate: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Format {
     U8,
     S16Le,
     FloatLe,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Stream {
     Playback,
     Capture,
@@ -191,7 +109,7 @@ impl SndPcm {
             let mut hw_params = SndPcmHwParams::new()?;
             hw_params.set_any(&res)?;
             hw_params.set_interleaved(&res)?;
-            hw_params.set_format(&res, params.format)?;
+            res.params.format = hw_params.set_format(&res, params.format)?;
             hw_params.set_channels(&res, params.channels)?;
             res.params.rate = hw_params.set_rate_near(&res, params.rate)?;
 
@@ -345,7 +263,10 @@ impl SndPcm {
 
     fn set_hw_params(&self, hw_params: &SndPcmHwParams) -> Result<(), Error> {
         unsafe {
-            try_snd!(alsa_ffi::snd_pcm_hw_params(self.raw_ptr, hw_params.raw_ptr));
+            try_snd!(
+                alsa_ffi::snd_pcm_hw_params(self.raw_ptr, hw_params.raw_ptr),
+                "Setting hardware parameters"
+            );
         }
         Ok(())
     }
@@ -384,7 +305,7 @@ impl SndPcm {
             self.prepare()?;
             Ok(())
         } else {
-            Err(AlsaError::new(errnum as i32).into())
+            Err(AlsaError::new(errnum as i32, "Writing samples").into())
         }
     }
 
@@ -445,7 +366,7 @@ impl Format {
         }
     }
 
-    fn to_audio_saver_format(&self) -> audio_saver::Format {
+    pub fn to_audio_saver_format(&self) -> audio_saver::Format {
         match self {
             Format::U8 => audio_saver::Format::U8,
             Format::S16Le => audio_saver::Format::S16Le,
@@ -739,15 +660,34 @@ impl SndPcmHwParams {
         Ok(())
     }
 
-    fn set_format(&mut self, pcm: &SndPcm, format: Format) -> Result<(), Error> {
+    fn set_format(&mut self, pcm: &SndPcm, format: Format) -> Result<Format, Error> {
+        let available = self.get_available_formats(pcm);
+        let format = if available.contains(&format) {
+            format
+        } else if let Some(format) = available.first() {
+            *format
+        } else {
+            return Err(AlsaError::new(
+                -22,
+                format!(
+                    "Setting audio format to {:?}. No formats are available.",
+                    format
+                ),
+            )
+            .into());
+        };
+
         unsafe {
-            try_snd!(alsa_ffi::snd_pcm_hw_params_set_format(
-                pcm.raw_ptr,
-                self.raw_ptr,
-                format.to_ffi(),
-            ));
+            try_snd!(
+                alsa_ffi::snd_pcm_hw_params_set_format(pcm.raw_ptr, self.raw_ptr, format.to_ffi(),),
+                format!(
+                    "Setting audio format to {:?}, although it should be available. \
+                     Available formats: {:?}",
+                    format, available
+                )
+            );
         }
-        Ok(())
+        Ok(format)
     }
 
     fn set_channels(&mut self, pcm: &SndPcm, channels: u32) -> Result<(), Error> {
@@ -835,6 +775,23 @@ impl SndPcmHwParams {
         }
 
         Ok(res)
+    }
+
+    fn get_available_formats(&self, pcm: &SndPcm) -> Vec<Format> {
+        let all_formats = [Format::S16Le, Format::FloatLe, Format::U8];
+
+        let mut res = Vec::new();
+        for format in &all_formats {
+            let test_res = unsafe {
+                alsa_ffi::snd_pcm_hw_params_test_format(pcm.raw_ptr, self.raw_ptr, format.to_ffi())
+            };
+
+            if test_res == 0 {
+                res.push(*format)
+            }
+        }
+
+        res
     }
 }
 impl Drop for SndPcmHwParams {
