@@ -2,8 +2,11 @@ use audio_sharing_pc::alsa;
 use audio_sharing_pc::audio_saver;
 use audio_sharing_pc::error::*;
 use audio_sharing_pc::exit_listener;
+use audio_sharing_pc::ffmpeg;
 use audio_sharing_pc::net_server;
+use audio_sharing_pc::net_server::NetServer;
 use audio_sharing_pc::thread_buffer;
+use std::process::exit;
 use std::sync::atomic::Ordering;
 
 pub fn list_alsa_devices() -> Result<(), Error> {
@@ -33,10 +36,19 @@ pub fn list_alsa_devices() -> Result<(), Error> {
 struct AudioWriter {
     file_writer: Box<dyn audio_saver::AudioWriter>,
     player: alsa::SndPcm,
+    server: NetServer,
+    resampler: Option<ffmpeg::Resampler>,
 }
 
 impl thread_buffer::DataReceiver for AudioWriter {
     fn new_slice(&mut self, data: &[u8]) -> Result<(), Error> {
+        let data = if let Some(resampler) = &mut self.resampler {
+            resampler.resample(data)?
+        } else {
+            data
+        };
+
+        self.server.send_to_all(data)?;
         self.file_writer.write_bytes_slice(data)?;
         self.player.write_interleaved(data)?;
         Ok(())
@@ -45,12 +57,18 @@ impl thread_buffer::DataReceiver for AudioWriter {
 
 fn record(name: String, params: alsa::Params) -> Result<(), Error> {
     let pcm_recorder = alsa::SndPcm::open(name, alsa::Stream::Capture, params)?;
-    let params = pcm_recorder.get_params();
+    let record_params = pcm_recorder.get_params();
     let pcm_player = alsa::SndPcm::open("default".to_owned(), alsa::Stream::Playback, params)?;
 
     println!("Opened '{}'", pcm_recorder.info()?.get_id());
     println!("Capture settings: {}", pcm_recorder.dump_settings()?);
     println!("Player settings: {}", pcm_player.dump_settings()?);
+
+    let resampler = if params != record_params {
+        Some(ffmpeg::Resampler::new(record_params.into(), params.into())?)
+    } else {
+        None
+    };
 
     let on_exit_receiver = exit_listener::listen_on_exit()?;
     let on_exit_flag = on_exit_receiver.signal_flag.clone();
@@ -70,6 +88,8 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
     let mut thread_writer = thread_buffer::ThreadBuffer::new(Box::new(AudioWriter {
         file_writer,
         player: pcm_player,
+        server,
+        resampler,
     }));
 
     let mut buffer = vec![0; 1024];
@@ -80,9 +100,6 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
         }
 
         let read = pcm_recorder.read_interleaved(buffer.as_mut_slice())?;
-        //        file_writer.write_bytes_slice(&buffer[..read])?;
-        //        pcm_player.write_interleaved(&buffer[..read])?;
-        server.send_to_all(&buffer[..read])?;
         thread_writer.write_data(&buffer[..read])?;
     }
 
@@ -92,7 +109,7 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
     Ok(())
 }
 
-fn main() -> Result<(), Error> {
+fn real_main() -> Result<(), Error> {
     list_alsa_devices()?;
 
     let params = alsa::Params {
@@ -104,4 +121,16 @@ fn main() -> Result<(), Error> {
     record("hw:3,1".to_owned(), params)?;
 
     Ok(())
+}
+
+fn main() {
+    let ret_code = match real_main() {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Error occurred: {}", e);
+            1
+        }
+    };
+
+    exit(ret_code);
 }

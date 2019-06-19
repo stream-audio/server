@@ -1,6 +1,7 @@
 use crate::alsa;
 use crate::audio_saver;
 use crate::channel;
+use crate::ffmpeg;
 use std::borrow::Cow;
 use std::io;
 
@@ -19,7 +20,9 @@ pub enum ErrorRepr {
     ChannelError(&'static str),
     ChannelRecv(channel::RecvError),
     Alsa(alsa::AlsaError),
+    Ffmpeg(ffmpeg::FfmpegError),
     Nul(std::ffi::NulError),
+    BytesWithNull(std::ffi::FromBytesWithNulError),
 }
 
 #[derive(Debug)]
@@ -71,7 +74,9 @@ impl ::std::fmt::Display for Error {
             ErrorRepr::ChannelError(e) => write!(f, "Channel Error {}", e),
             ErrorRepr::ChannelRecv(e) => write!(f, "Channel Error {}", e),
             ErrorRepr::Alsa(ref e) => write!(f, "Alsa Error {}", e),
+            ErrorRepr::Ffmpeg(ref e) => write!(f, "ffmpeg Error {}", e),
             ErrorRepr::Nul(ref e) => write!(f, "There is null byte in the string. {}", e),
+            ErrorRepr::BytesWithNull(ref e) => e.fmt(f),
         }
     }
 }
@@ -112,9 +117,19 @@ impl From<alsa::AlsaError> for Error {
         Self::new(ErrorRepr::Alsa(e))
     }
 }
+impl From<ffmpeg::FfmpegError> for Error {
+    fn from(e: ffmpeg::FfmpegError) -> Self {
+        Self::new(ErrorRepr::Ffmpeg(e))
+    }
+}
 impl From<std::ffi::NulError> for Error {
     fn from(e: std::ffi::NulError) -> Self {
         Self::new(ErrorRepr::Nul(e))
+    }
+}
+impl From<std::ffi::FromBytesWithNulError> for Error {
+    fn from(e: std::ffi::FromBytesWithNulError) -> Self {
+        Self::new(ErrorRepr::BytesWithNull(e))
     }
 }
 impl From<ErrorRepr> for Error {

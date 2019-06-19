@@ -17,7 +17,7 @@ pub struct ThreadBuffer {
 impl ThreadBuffer {
     pub fn new(writer: Box<dyn DataReceiver>) -> Self {
         let que = Arc::new(ThreadQueue::default());
-        let mut thread_self = ThreadData::new(que.clone(), writer);
+        let thread_self = ThreadData::new(que.clone(), writer);
 
         let thread = thread::Builder::new()
             .name("ThreadBuffer".to_owned())
@@ -84,7 +84,7 @@ impl ThreadData {
         }
     }
 
-    fn thread_loop(&mut self) {
+    fn thread_loop(mut self) {
         loop {
             let can_continue = self.wait_and_fill_buffer();
             if !can_continue {

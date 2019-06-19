@@ -3,6 +3,7 @@ mod alsa_ffi;
 
 use crate::audio_saver;
 use crate::error::*;
+use crate::ffmpeg;
 use alsa_ffi::{snd_pcm_sframes_t, snd_pcm_uframes_t};
 use libc::{c_int, c_uint, c_void};
 use std::borrow::Cow;
@@ -59,7 +60,7 @@ impl std::fmt::Display for AlsaError {
 }
 impl std::error::Error for AlsaError {}
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
     pub format: Format,
     pub channels: u32,
@@ -85,6 +86,25 @@ pub struct SndPcm {
     params: Params,
     buffer_size: snd_pcm_uframes_t,
 }
+
+impl Into<ffmpeg::AudioParams> for Params {
+    fn into(self) -> ffmpeg::AudioParams {
+        ffmpeg::AudioParams {
+            rate: self.rate as _,
+            format: self.format.into(),
+        }
+    }
+}
+impl Into<ffmpeg::AudioSampleFormat> for Format {
+    fn into(self) -> ffmpeg::AudioSampleFormat {
+        match self {
+            Format::U8 => ffmpeg::AudioSampleFormat::U8,
+            Format::S16Le => ffmpeg::AudioSampleFormat::S16Le,
+            Format::FloatLe => ffmpeg::AudioSampleFormat::FloatLe,
+        }
+    }
+}
+
 impl SndPcm {
     pub fn open(name: String, stream: Stream, params: Params) -> Result<Self, Error> {
         unsafe {
