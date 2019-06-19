@@ -93,6 +93,7 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
     }));
 
     let mut buffer = vec![0; 1024];
+    pcm_recorder.reset()?;
     loop {
         if on_exit_flag.load(Ordering::SeqCst) {
             eprintln!("Caught Signal, finishing job");

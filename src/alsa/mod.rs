@@ -231,6 +231,13 @@ impl SndPcm {
         Ok(())
     }
 
+    pub fn reset(&self) -> Result<(), Error> {
+        unsafe {
+            try_snd!(alsa_ffi::snd_pcm_reset(self.raw_ptr));
+        }
+        Ok(())
+    }
+
     pub fn dump_settings(&self) -> Result<String, Error> {
         let buffer = SndOutput::new()?;
         unsafe {

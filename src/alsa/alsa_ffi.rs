@@ -146,7 +146,10 @@ extern "C" {
     ) -> c_int;
 
     pub fn snd_pcm_drain(pcm: *mut snd_pcm_t) -> c_int;
+    pub fn snd_pcm_drop(pcm: *mut snd_pcm_t) -> c_int;
+    pub fn snd_pcm_start(pcm: *mut snd_pcm_t) -> c_int;
     pub fn snd_pcm_close(pcm: *mut snd_pcm_t) -> c_int;
+    pub fn snd_pcm_reset(pcm: *mut snd_pcm_t) -> c_int;
 
     pub fn snd_pcm_set_params(
         pcm: *mut snd_pcm_t,
