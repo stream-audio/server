@@ -20,7 +20,7 @@ pub enum ErrorRepr {
     ChannelError(&'static str),
     ChannelRecv(channel::RecvError),
     Alsa(alsa::AlsaError),
-    Ffmpeg(ffmpeg::FfmpegError),
+    Ffmpeg(ffmpeg::Error),
     Nul(std::ffi::NulError),
     BytesWithNull(std::ffi::FromBytesWithNulError),
 }
@@ -117,9 +117,12 @@ impl From<alsa::AlsaError> for Error {
         Self::new(ErrorRepr::Alsa(e))
     }
 }
-impl From<ffmpeg::FfmpegError> for Error {
-    fn from(e: ffmpeg::FfmpegError) -> Self {
-        Self::new(ErrorRepr::Ffmpeg(e))
+impl From<ffmpeg::Error> for Error {
+    fn from(e: ffmpeg::Error) -> Self {
+        match *e.repr {
+            ffmpeg::ErrorRepr::BytesWithNull(e) => Self::new(ErrorRepr::BytesWithNull(e)),
+            _ => Self::new(ErrorRepr::Ffmpeg(e)),
+        }
     }
 }
 impl From<std::ffi::NulError> for Error {

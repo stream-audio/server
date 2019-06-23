@@ -4,7 +4,6 @@ use audio_sharing_pc::error::*;
 use audio_sharing_pc::exit_listener;
 use audio_sharing_pc::ffmpeg;
 use audio_sharing_pc::net_server;
-use audio_sharing_pc::net_server::NetServer;
 use audio_sharing_pc::thread_buffer;
 use std::process::exit;
 use std::sync::atomic::Ordering;
@@ -36,19 +35,10 @@ pub fn list_alsa_devices() -> Result<(), Error> {
 struct AudioWriter {
     file_writer: Box<dyn audio_saver::AudioWriter>,
     player: alsa::SndPcm,
-    server: NetServer,
-    resampler: Option<ffmpeg::Resampler>,
 }
 
 impl thread_buffer::DataReceiver for AudioWriter {
     fn new_slice(&mut self, data: &[u8]) -> Result<(), Error> {
-        let data = if let Some(resampler) = &mut self.resampler {
-            resampler.resample(data)?
-        } else {
-            data
-        };
-
-        self.server.send_to_all(data)?;
         self.file_writer.write_bytes_slice(data)?;
         self.player.write_interleaved(data)?;
         Ok(())
@@ -64,11 +54,19 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
     println!("Capture settings: {}", pcm_recorder.dump_settings()?);
     println!("Player settings: {}", pcm_player.dump_settings()?);
 
-    let resampler = if params != record_params {
+    let mut resampler = if params != record_params {
         Some(ffmpeg::Resampler::new(record_params.into(), params.into())?)
     } else {
         None
     };
+
+    let encoder_params = ffmpeg::CodecParams {
+        codec: ffmpeg::Codec::Mp2,
+        bit_rate: 128000,
+        audio_params: params.into(),
+    };
+    let mut encoder = ffmpeg::Encoder::new(encoder_params)?;
+    let mut decoder = ffmpeg::Decoder::new(encoder_params.codec)?;
 
     let on_exit_receiver = exit_listener::listen_on_exit()?;
     let on_exit_flag = on_exit_receiver.signal_flag.clone();
@@ -88,8 +86,6 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
     let mut thread_writer = thread_buffer::ThreadBuffer::new(Box::new(AudioWriter {
         file_writer,
         player: pcm_player,
-        server,
-        resampler,
     }));
 
     let mut buffer = vec![0; 1024];
@@ -101,7 +97,26 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
         }
 
         let read = pcm_recorder.read_interleaved(buffer.as_mut_slice())?;
-        thread_writer.write_data(&buffer[..read])?;
+        let data = &buffer[..read];
+        let data = if let Some(resampler) = &mut resampler {
+            resampler.resample(data)?
+        } else {
+            data
+        };
+
+        /*
+        server.send_to_all(data)?;
+        thread_writer.write_data(data)?;
+        */
+
+        encoder.write(data)?;
+        while let Some(encoded_data) = encoder.read()? {
+            decoder.write(encoded_data)?;
+            while let Some(data) = decoder.read()? {
+                server.send_to_all(data)?;
+                thread_writer.write_data(data)?;
+            }
+        }
     }
 
     pcm_recorder.stop()?;
