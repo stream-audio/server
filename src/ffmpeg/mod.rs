@@ -5,10 +5,12 @@ mod macroses;
 mod codec;
 pub mod error;
 mod ffmpeg_const;
+mod format;
 mod resample;
 
 #[link(name = "avutil")]
 #[link(name = "avcodec")]
+#[link(name = "avformat")]
 #[link(name = "swresample")]
 extern "C" {}
 
@@ -61,6 +63,31 @@ impl AudioSampleFormat {
             AudioSampleFormat::U8 | AudioSampleFormat::U8P => 1,
             AudioSampleFormat::S16Le | AudioSampleFormat::S16LeP => 2,
             AudioSampleFormat::FloatLe | AudioSampleFormat::FloatLeP => 4,
+        }
+    }
+
+    fn is_planar(self) -> bool {
+        match self {
+            AudioSampleFormat::U8 | AudioSampleFormat::S16Le | AudioSampleFormat::FloatLe => false,
+            AudioSampleFormat::U8P | AudioSampleFormat::S16LeP | AudioSampleFormat::FloatLeP => {
+                true
+            }
+        }
+    }
+
+    fn to_planar(self) -> Self {
+        match self {
+            AudioSampleFormat::U8 | AudioSampleFormat::U8P => AudioSampleFormat::U8P,
+            AudioSampleFormat::S16Le | AudioSampleFormat::S16LeP => AudioSampleFormat::S16LeP,
+            AudioSampleFormat::FloatLe | AudioSampleFormat::FloatLeP => AudioSampleFormat::FloatLeP,
+        }
+    }
+
+    fn to_interleaved(self) -> Self {
+        match self {
+            AudioSampleFormat::U8 | AudioSampleFormat::U8P => AudioSampleFormat::U8,
+            AudioSampleFormat::S16Le | AudioSampleFormat::S16LeP => AudioSampleFormat::S16Le,
+            AudioSampleFormat::FloatLe | AudioSampleFormat::FloatLeP => AudioSampleFormat::FloatLe,
         }
     }
 }

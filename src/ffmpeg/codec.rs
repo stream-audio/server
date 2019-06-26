@@ -1,16 +1,15 @@
 use super::{
-    error::UnsupportedSampleFormatError, ffmpeg_const, ffmpeg_ffi, AudioParams, AudioSampleFormat,
-    Error, InternalError,
+    error::UnsupportedSampleFormatError, ffmpeg_const, ffmpeg_ffi, format, AudioParams,
+    AudioSampleFormat, Error, InternalError,
 };
-use std::collections::VecDeque;
 use std::ptr;
 use std::slice;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Codec {
-    Mp2,
     Aac,
     AacLd,
+    Mp2,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -24,7 +23,8 @@ pub struct Encoder {
     ctx: AvCodecContext,
     pkt: AvPacket,
     frame: AvFrameEncoder,
-    write_buf: VecDeque<u8>,
+    write_buf: Vec<u8>,
+    formatter: format::SinglePacketFormatter,
 }
 
 pub struct Decoder {
@@ -32,6 +32,7 @@ pub struct Decoder {
     parser: AvCodecParserContext,
     pkt: AvPacket,
     frame: AvFrameDecoder,
+    write_buf: Vec<u8>,
     read_buf: Vec<u8>,
 }
 
@@ -40,26 +41,34 @@ impl Encoder {
         let ctx = AvCodecContext::new_encoder(params)?;
         let pkt = AvPacket::new()?;
         let frame = AvFrameEncoder::new(&ctx)?;
+        let formatter = format::SinglePacketFormatter::new(&ctx, params.codec)?;
 
         Ok(Self {
             ctx,
             pkt,
             frame,
-            write_buf: VecDeque::new(),
+            write_buf: Vec::new(),
+            formatter,
         })
     }
 
     pub fn write(&mut self, in_buf: &[u8]) -> Result<(), Error> {
-        self.write_buf.extend(in_buf.iter());
+        self.write_buf.extend_from_slice(in_buf);
 
+        let mut total_copied = 0;
         loop {
-            let res = self.frame.move_from_vec_deque(&mut self.write_buf)?;
-            if res.is_none() {
-                break;
+            let res = self
+                .frame
+                .copy_from_slice(&self.write_buf[total_copied..])?;
+            match res {
+                Some(copied) => total_copied += copied,
+                None => break,
             }
 
             self.ctx.send_frame(&self.frame)?;
         }
+
+        self.write_buf.drain(..total_copied);
 
         Ok(())
     }
@@ -68,15 +77,20 @@ impl Encoder {
         self.pkt.unref();
 
         let res = self.ctx.receive_pkt(&mut self.pkt);
-        if let Err(e) = res {
-            if e.is_again_or_eof() {
-                return Ok(None);
-            } else {
-                return Err(e.into());
+        match res {
+            Ok(()) => {
+                // Ok(Some(self.pkt.get_buf_ref()))
+                self.formatter.write_pkt(&self.pkt)?;
+                Ok(Some(self.formatter.get_buf()))
+            }
+            Err(e) => {
+                if e.is_again_or_eof() {
+                    Ok(None)
+                } else {
+                    Err(e.into())
+                }
             }
         }
-
-        Ok(Some(self.pkt.get_buf_ref()))
     }
 }
 
@@ -92,24 +106,34 @@ impl Decoder {
             parser,
             pkt,
             frame,
+            write_buf: Vec::new(),
             read_buf: Vec::new(),
         })
     }
 
-    pub fn write(&mut self, in_buf: &[u8]) -> Result<usize, Error> {
+    pub fn write(&mut self, in_buf: &[u8]) -> Result<(), Error> {
+        const BUFFER_PADDING_SIZE: usize = ffmpeg_ffi::AV_INPUT_BUFFER_PADDING_SIZE as _;
+
+        self.write_buf.extend_from_slice(in_buf);
+        self.write_buf.reserve(BUFFER_PADDING_SIZE);
+
         let mut written_bytes = 0;
 
-        while written_bytes < in_buf.len() {
-            let parsed = self
-                .parser
-                .parse(&self.ctx, &mut self.pkt, &in_buf[written_bytes..])?;
+        while written_bytes < self.write_buf.len() {
+            let parsed =
+                self.parser
+                    .parse(&self.ctx, &mut self.pkt, &self.write_buf[written_bytes..])?;
 
             written_bytes += parsed;
 
-            self.ctx.send_pkt(&self.pkt)?;
+            if !self.pkt.is_empty() {
+                self.ctx.send_pkt(&self.pkt)?;
+            }
         }
 
-        Ok(written_bytes)
+        self.write_buf.clear();
+
+        Ok(())
     }
 
     pub fn read(&mut self) -> Result<Option<&[u8]>, Error> {
@@ -131,8 +155,8 @@ impl Decoder {
 
 const LAYOUT: u32 = super::resample::LAYOUT;
 
-struct AvCodecContext {
-    raw_ptr: *mut ffmpeg_ffi::AVCodecContext,
+pub struct AvCodecContext {
+    pub raw_ptr: *mut ffmpeg_ffi::AVCodecContext,
     av_codec: AvCodec,
 }
 
@@ -144,13 +168,15 @@ struct AvCodec {
     raw_ptr: *const ffmpeg_ffi::AVCodec,
 }
 
-struct AvPacket {
-    raw_ptr: *mut ffmpeg_ffi::AVPacket,
+pub struct AvPacket {
+    pub raw_ptr: *mut ffmpeg_ffi::AVPacket,
 }
 
 struct AvFrameEncoder {
     raw_ptr: *mut ffmpeg_ffi::AVFrame,
     size: usize,
+    is_planar: bool,
+    channels: usize,
 }
 
 struct AvFrameDecoder {
@@ -160,15 +186,22 @@ struct AvFrameDecoder {
 impl Codec {
     fn to_raw(self) -> ffmpeg_ffi::AVCodecID {
         match self {
-            Codec::Mp2 => ffmpeg_ffi::AVCodecID_AV_CODEC_ID_MP2,
             Codec::Aac | Codec::AacLd => ffmpeg_ffi::AVCodecID_AV_CODEC_ID_AAC,
+            Codec::Mp2 => ffmpeg_ffi::AVCodecID_AV_CODEC_ID_MP2,
         }
     }
 
     fn get_profile(self) -> Option<i32> {
         match self {
-            Codec::Mp2 | Codec::Aac => None,
             Codec::AacLd => Some(ffmpeg_ffi::FF_PROFILE_AAC_LD as _),
+            _ => None,
+        }
+    }
+
+    pub fn get_default_muxer_name(self) -> &'static str {
+        match self {
+            Codec::Aac | Codec::AacLd => "adts",
+            Codec::Mp2 => "data",
         }
     }
 }
@@ -183,10 +216,10 @@ impl AvCodecContext {
                 return Err(Error::new_cannot_allocate("audio coder context (encoder)").into());
             }
 
-            let res = Self { raw_ptr, av_codec };
+            let mut res = Self { raw_ptr, av_codec };
 
+            res.set_and_validate_sample_fmt(params.audio_params.format)?;
             (*res.raw_ptr).bit_rate = params.bit_rate as _;
-            (*res.raw_ptr).sample_fmt = params.audio_params.format.to_raw();
             (*res.raw_ptr).sample_rate = params.audio_params.rate;
             (*res.raw_ptr).channel_layout = LAYOUT as _;
             (*res.raw_ptr).channels = ffmpeg_ffi::av_get_channel_layout_nb_channels(LAYOUT as _);
@@ -194,12 +227,12 @@ impl AvCodecContext {
                 (*res.raw_ptr).profile = profile;
             }
 
-            res.validate_sample_fmt()?;
-
             try_ffmpeg!(
                 ffmpeg_ffi::avcodec_open2(res.raw_ptr, res.av_codec.raw_ptr, ptr::null_mut()),
                 "opening codec (encoder)"
             );
+
+            eprintln!("frame_size: {}", (*res.raw_ptr).frame_size);
 
             Ok(res)
         }
@@ -225,8 +258,15 @@ impl AvCodecContext {
         }
     }
 
+    #[allow(dead_code)]
     fn get_sample_format(&self) -> Option<AudioSampleFormat> {
         unsafe { AudioSampleFormat::from_raw((*self.raw_ptr).sample_fmt) }
+    }
+
+    fn set_sample_format(&mut self, format: AudioSampleFormat) {
+        unsafe {
+            (*self.raw_ptr).sample_fmt = format.to_raw();
+        }
     }
 
     fn get_frame_size_in_bytes(&self) -> usize {
@@ -288,17 +328,33 @@ impl AvCodecContext {
         Ok(())
     }
 
-    fn validate_sample_fmt(&self) -> Result<(), Error> {
+    fn set_and_validate_sample_fmt(&mut self, format: AudioSampleFormat) -> Result<(), Error> {
         let supported_formats = self.av_codec.get_supported_sample_formats();
+        eprintln!("{:?}", supported_formats);
 
-        let format = self.get_sample_format().unwrap();
+        let supported_interleaved_formats = || {
+            return supported_formats
+                .iter()
+                .map(|f| f.to_interleaved())
+                .collect::<Vec<AudioSampleFormat>>();
+        };
 
-        if supported_formats.contains(&format) {
+        if format.is_planar() {
+            Err(UnsupportedSampleFormatError {
+                fmt: format,
+                supported: supported_interleaved_formats(),
+            }
+            .into())
+        } else if supported_formats.contains(&format) {
+            self.set_sample_format(format);
+            Ok(())
+        } else if supported_formats.contains(&format.to_planar()) {
+            self.set_sample_format(format.to_planar());
             Ok(())
         } else {
             Err(UnsupportedSampleFormatError {
                 fmt: format,
-                supported: supported_formats,
+                supported: supported_interleaved_formats(),
             }
             .into())
         }
@@ -407,6 +463,14 @@ impl AvPacket {
         }
     }
 
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn len(&self) -> usize {
+        unsafe { (*self.raw_ptr).size as _ }
+    }
+
     #[allow(dead_code)]
     fn copy_to(&self, out_buf: &mut Vec<u8>) -> usize {
         unsafe {
@@ -419,6 +483,7 @@ impl AvPacket {
         }
     }
 
+    #[allow(dead_code)]
     fn get_buf_ref(&self) -> &[u8] {
         unsafe {
             let raw_ptr = &*self.raw_ptr;
@@ -450,6 +515,8 @@ impl AvFrameEncoder {
             let res = Self {
                 raw_ptr,
                 size: context.get_frame_size_in_bytes(),
+                is_planar: context.get_sample_format().map_or(false, |f| f.is_planar()),
+                channels: context.get_channels_qty(),
             };
 
             (*res.raw_ptr).nb_samples = (*context.raw_ptr).frame_size;
@@ -476,7 +543,6 @@ impl AvFrameEncoder {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn copy_from_slice(&mut self, buf: &[u8]) -> Result<Option<usize>, Error> {
         if buf.len() < self.size {
             return Ok(None);
@@ -484,30 +550,40 @@ impl AvFrameEncoder {
 
         self.make_writable()?;
 
-        unsafe {
-            let to_buf = slice::from_raw_parts_mut((*self.raw_ptr).data[0], self.size);
-            to_buf.copy_from_slice(&buf[..self.size]);
+        if self.is_planar {
+            self.copy_planar_from_slice(&buf[..self.size]);
+        } else {
+            self.copy_interleaved_from_slice(&buf[..self.size]);
         }
 
         Ok(Some(self.size))
     }
 
-    fn move_from_vec_deque(&mut self, from: &mut VecDeque<u8>) -> Result<Option<usize>, Error> {
-        if from.len() < self.size {
-            return Ok(None);
-        }
-
-        self.make_writable()?;
-
+    fn copy_planar_from_slice(&mut self, buf: &[u8]) {
         unsafe {
-            let to_buf = slice::from_raw_parts_mut((*self.raw_ptr).data[0], self.size);
+            let to_data = &(*self.raw_ptr).data;
+            let mut written_len = 0isize;
 
-            for (dst, src) in to_buf.iter_mut().zip(from.drain(..self.size)) {
-                *dst = src;
+            let format = AudioSampleFormat::from_raw((*self.raw_ptr).format).unwrap();
+            let sample_size = format.get_sample_size();
+
+            for from_channels in buf.chunks_exact(sample_size * self.channels) {
+                for (ch, from) in from_channels.chunks_exact(sample_size).enumerate() {
+                    let to_buf =
+                        slice::from_raw_parts_mut(to_data[ch].offset(written_len), sample_size);
+
+                    to_buf.copy_from_slice(from);
+                }
+                written_len += sample_size as isize;
             }
-        }
 
-        Ok(Some(self.size))
+            assert_eq!(written_len as usize * self.channels, self.size);
+        }
+    }
+
+    fn copy_interleaved_from_slice(&mut self, buf: &[u8]) {
+        let to_buf = unsafe { slice::from_raw_parts_mut((*self.raw_ptr).data[0], self.size) };
+        to_buf.copy_from_slice(buf);
     }
 }
 impl Drop for AvFrameEncoder {
@@ -551,15 +627,6 @@ impl AvFrameDecoder {
             }
         }
     }
-
-    /*
-    fn get_buf_ref  (&self) -> &[u8] {
-        unsafe {
-            let raw_ptr = &*self.raw_ptr;
-            slice::from_raw_parts(*raw_ptr.data, raw_ptr.size as usize)
-        }
-    }
-    */
 }
 impl Drop for AvFrameDecoder {
     fn drop(&mut self) {

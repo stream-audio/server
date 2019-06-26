@@ -61,7 +61,7 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
     };
 
     let encoder_params = ffmpeg::CodecParams {
-        codec: ffmpeg::Codec::Mp2,
+        codec: ffmpeg::Codec::Aac,
         bit_rate: 128000,
         audio_params: params.into(),
     };
@@ -104,11 +104,6 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
             data
         };
 
-        /*
-        server.send_to_all(data)?;
-        thread_writer.write_data(data)?;
-        */
-
         encoder.write(data)?;
         while let Some(encoded_data) = encoder.read()? {
             decoder.write(encoded_data)?;
@@ -129,7 +124,7 @@ fn real_main() -> Result<(), Error> {
     list_alsa_devices()?;
 
     let params = alsa::Params {
-        format: alsa::Format::S16Le,
+        format: alsa::Format::FloatLe,
         channels: 2,
         rate: 44100,
     };
