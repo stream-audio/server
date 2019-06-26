@@ -2,11 +2,11 @@ use audio_sharing_pc::alsa;
 use audio_sharing_pc::audio_saver;
 use audio_sharing_pc::error::*;
 use audio_sharing_pc::exit_listener;
-use audio_sharing_pc::ffmpeg;
 use audio_sharing_pc::net_server;
 use audio_sharing_pc::thread_buffer;
 use std::process::exit;
 use std::sync::atomic::Ordering;
+use stream_audio_ffmpeg as ffmpeg;
 
 pub fn list_alsa_devices() -> Result<(), Error> {
     for ctl in alsa::SndCtl::list_cards() {
@@ -62,7 +62,7 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
 
     let encoder_params = ffmpeg::CodecParams {
         codec: ffmpeg::Codec::Aac,
-        bit_rate: 128000,
+        bit_rate: 96000,
         audio_params: params.into(),
     };
     let mut encoder = ffmpeg::Encoder::new(encoder_params)?;
@@ -98,10 +98,9 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
 
         let read = pcm_recorder.read_interleaved(buffer.as_mut_slice())?;
         let data = &buffer[..read];
-        let data = if let Some(resampler) = &mut resampler {
-            resampler.resample(data)?
-        } else {
-            data
+        let data = match &mut resampler {
+            Some(resampler) => resampler.resample(data)?,
+            None => data,
         };
 
         encoder.write(data)?;
