@@ -7,7 +7,7 @@ edition = "2018"
 [dependencies]
 hound = "3.4"
 crossbeam-channel = "0.3"
-signal-hook = "0.1.5"
+signal-hook = "0.1"
 libc = "0.2"
 mio = "0.6"
 stream-audio-ffmpeg = { git="https://github.com/stream-audio/ffmpeg.git" }
