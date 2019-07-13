@@ -6,6 +6,7 @@ use audio_sharing_pc::net_server;
 use audio_sharing_pc::thread_buffer;
 use std::process::exit;
 use std::sync::atomic::Ordering;
+use std::env;
 use stream_audio_ffmpeg as ffmpeg;
 
 pub fn list_alsa_devices() -> Result<(), Error> {
@@ -128,7 +129,9 @@ fn real_main() -> Result<(), Error> {
         rate: 44100,
     };
 
-    record("hw:3,1".to_owned(), params)?;
+    let hw_name = env::args().nth(1).unwrap_or_else(|| "hw:3,1".to_owned());
+
+    record(hw_name, params)?;
 
     Ok(())
 }
