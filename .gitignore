@@ -5,3 +5,4 @@ Cargo.lock
 
 # Visual Studio Code
 .vscode/
+*.code-workspace
