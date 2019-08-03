@@ -4,9 +4,9 @@ use audio_sharing_pc::error::*;
 use audio_sharing_pc::exit_listener;
 use audio_sharing_pc::net_server;
 use audio_sharing_pc::thread_buffer;
+use std::env;
 use std::process::exit;
 use std::sync::atomic::Ordering;
-use std::env;
 use stream_audio_ffmpeg as ffmpeg;
 
 pub fn list_alsa_devices() -> Result<(), Error> {
@@ -33,15 +33,30 @@ pub fn list_alsa_devices() -> Result<(), Error> {
     Ok(())
 }
 
-struct AudioWriter {
-    file_writer: Box<dyn audio_saver::AudioWriter>,
+struct ThreadPlayer {
+    _file_writer: Box<dyn audio_saver::AudioWriter>,
     player: alsa::SndPcm,
 }
 
-impl thread_buffer::DataReceiver for AudioWriter {
+struct ThreadServerWriter {
+    server: net_server::NetServer,
+    encoder: ffmpeg::Encoder,
+}
+
+impl thread_buffer::DataReceiver for ThreadPlayer {
     fn new_slice(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.file_writer.write_bytes_slice(data)?;
+        // self.file_writer.write_bytes_slice(data)?;
         self.player.write_interleaved(data)?;
+        Ok(())
+    }
+}
+
+impl thread_buffer::DataReceiver for ThreadServerWriter {
+    fn new_slice(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.encoder.write(data)?;
+        while let Some(data) = self.encoder.read()? {
+            self.server.send_to_all(data)?;
+        }
         Ok(())
     }
 }
@@ -66,8 +81,7 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
         bit_rate: 96000,
         audio_params: params.into(),
     };
-    let mut encoder = ffmpeg::Encoder::new(encoder_params)?;
-    let mut decoder = ffmpeg::Decoder::new(encoder_params.codec)?;
+    let encoder = ffmpeg::Encoder::new(encoder_params)?;
 
     let on_exit_receiver = exit_listener::listen_on_exit()?;
     let on_exit_flag = on_exit_receiver.signal_flag.clone();
@@ -84,12 +98,15 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
     let file_writer =
         audio_saver::create_factory(audio_saver::AudioType::Wav)?.create_writer(writer_settings)?;
 
-    let mut thread_writer = thread_buffer::ThreadBuffer::new(Box::new(AudioWriter {
-        file_writer,
+    let mut thread_player = thread_buffer::ThreadBuffer::new(Box::new(ThreadPlayer {
+        _file_writer: file_writer,
         player: pcm_player,
     }));
 
-    let mut buffer = vec![0; 1024];
+    let mut thread_server_writer =
+        thread_buffer::ThreadBuffer::new(Box::new(ThreadServerWriter { server, encoder }));
+
+    let mut buffer = vec![0; 4068];
     pcm_recorder.reset()?;
     loop {
         if on_exit_flag.load(Ordering::SeqCst) {
@@ -104,18 +121,13 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
             None => data,
         };
 
-        encoder.write(data)?;
-        while let Some(encoded_data) = encoder.read()? {
-            decoder.write(encoded_data)?;
-            while let Some(data) = decoder.read()? {
-                server.send_to_all(data)?;
-                thread_writer.write_data(data)?;
-            }
-        }
+        thread_player.write_data(data)?;
+        thread_server_writer.write_data(data)?;
     }
 
     pcm_recorder.stop()?;
-    thread_writer.stop_and_join();
+    thread_player.stop_and_join();
+    thread_server_writer.stop_and_join();
 
     Ok(())
 }

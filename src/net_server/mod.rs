@@ -1,3 +1,5 @@
+mod pkt;
+
 use crate::error::{Error, IoError};
 use crate::exit_listener;
 use mio;
@@ -9,7 +11,7 @@ use std::thread;
 
 pub struct NetServer {
     que: Arc<Mutex<SendQueue>>,
-    ned_data_readiness: mio::SetReadiness,
+    new_data_readiness: mio::SetReadiness,
 }
 
 const UDP_TOKEN: mio::Token = mio::Token(0);
@@ -51,7 +53,7 @@ impl NetServer {
 
         let res = Self {
             que: que.clone(),
-            ned_data_readiness: set_readiness,
+            new_data_readiness: set_readiness,
         };
 
         let poll_loop = PollLoop {
@@ -60,6 +62,7 @@ impl NetServer {
             stopper,
             clients: Vec::new(),
             que,
+            pkt_gen: pkt::NetworkPktGenerator::new(),
         };
 
         thread::spawn(move || poll_loop.poll_loop());
@@ -81,7 +84,7 @@ impl NetServer {
         block.extend_from_slice(buf);
         que.to_send.push_back(block);
 
-        self.ned_data_readiness
+        self.new_data_readiness
             .set_readiness(mio::Ready::readable())
             .map_err(|e| IoError::new("sending signal to Poll of a new data block", e))?;
 
@@ -95,6 +98,7 @@ struct PollLoop {
     stopper: exit_listener::SignalEvent,
     clients: Vec<SocketAddr>,
     que: Arc<Mutex<SendQueue>>,
+    pkt_gen: pkt::NetworkPktGenerator,
 }
 
 struct SendQueue {
@@ -115,9 +119,7 @@ impl PollLoop {
                         let res = self.socket.recv_from(buf.as_mut_slice());
 
                         match res {
-                            Ok((n, back_addr)) => {
-                                self.new_connection(&buf[..n], back_addr);
-                            }
+                            Ok((n, back_addr)) => self.new_connection(&buf[..n], back_addr),
                             Err(e) => self.read_err(e),
                         };
                     }
@@ -148,13 +150,17 @@ impl PollLoop {
         let mut que = self.que.lock().unwrap();
 
         while let Some(mut block) = que.to_send.pop_front() {
+            self.pkt_gen.wrap_in_pkt(&mut block);
+
             let mut clients_to_remove = Vec::new();
 
-            for (idx, addr) in self.clients.iter().enumerate() {
-                let res = self.socket.send_to(&block, &addr);
-                if let Err(e) = res {
-                    eprintln!("Error sending data block to {}. {}", addr, e);
-                    clients_to_remove.push(idx);
+            for _ in 0..2 {
+                for (idx, addr) in self.clients.iter().enumerate() {
+                    let res = self.socket.send_to(&block, &addr);
+                    if let Err(e) = res {
+                        eprintln!("Error sending data block to {}. {}", addr, e);
+                        clients_to_remove.push(idx);
+                    }
                 }
             }
 
