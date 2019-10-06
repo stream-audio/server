@@ -10,5 +10,6 @@ crossbeam-channel = "0.3"
 signal-hook = "0.1"
 libc = "0.2"
 mio = "0.6"
+clap = "2.33"
 stream-audio-ffmpeg = { git="https://github.com/stream-audio/ffmpeg.git" }
 #stream-audio-ffmpeg = { path="../ffmpeg" }

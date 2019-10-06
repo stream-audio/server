@@ -4,7 +4,7 @@ use audio_sharing_pc::error::*;
 use audio_sharing_pc::exit_listener;
 use audio_sharing_pc::net_server;
 use audio_sharing_pc::thread_buffer;
-use std::env;
+use clap;
 use std::process::exit;
 use std::sync::atomic::Ordering;
 use stream_audio_ffmpeg as ffmpeg;
@@ -61,14 +61,24 @@ impl thread_buffer::DataReceiver for ThreadServerWriter {
     }
 }
 
-fn record(name: String, params: alsa::Params) -> Result<(), Error> {
+fn record(name: String, params: alsa::Params, should_play_locally: bool) -> Result<(), Error> {
     let pcm_recorder = alsa::SndPcm::open(name, alsa::Stream::Capture, params)?;
     let record_params = pcm_recorder.get_params();
-    let pcm_player = alsa::SndPcm::open("default".to_owned(), alsa::Stream::Playback, params)?;
+    let pcm_player = if should_play_locally {
+        Some(alsa::SndPcm::open(
+            "default".to_owned(),
+            alsa::Stream::Playback,
+            params,
+        )?)
+    } else {
+        None
+    };
 
     println!("Opened '{}'", pcm_recorder.info()?.get_id());
     println!("Capture settings: {}", pcm_recorder.dump_settings()?);
-    println!("Player settings: {}", pcm_player.dump_settings()?);
+    if let Some(p) = &pcm_player {
+        println!("Player settings: {}", p.dump_settings()?);
+    }
 
     let mut resampler = if params != record_params {
         Some(ffmpeg::Resampler::new(record_params.into(), params.into())?)
@@ -98,10 +108,14 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
     let file_writer =
         audio_saver::create_factory(audio_saver::AudioType::Wav)?.create_writer(writer_settings)?;
 
-    let mut thread_player = thread_buffer::ThreadBuffer::new(Box::new(ThreadPlayer {
-        _file_writer: file_writer,
-        player: pcm_player,
-    }));
+    let mut thread_player = if let Some(p) = pcm_player {
+        Some(thread_buffer::ThreadBuffer::new(Box::new(ThreadPlayer {
+            _file_writer: file_writer,
+            player: p,
+        })))
+    } else {
+        None
+    };
 
     let mut thread_server_writer =
         thread_buffer::ThreadBuffer::new(Box::new(ThreadServerWriter { server, encoder }));
@@ -121,19 +135,55 @@ fn record(name: String, params: alsa::Params) -> Result<(), Error> {
             None => data,
         };
 
-        thread_player.write_data(data)?;
+        if let Some(t) = &thread_player {
+            t.write_data(data)?;
+        }
         thread_server_writer.write_data(data)?;
     }
 
     pcm_recorder.stop()?;
-    thread_player.stop_and_join();
+    thread_player.as_mut().map(|t| t.stop_and_join());
     thread_server_writer.stop_and_join();
 
     Ok(())
 }
 
 fn real_main() -> Result<(), Error> {
-    list_alsa_devices()?;
+    let matches = clap::App::new("Audio Streaming Server")
+        .version("1.0")
+        .author("Anton R.")
+        .about("Captures audio using snd-aloop kernel module, and streams it to the android device")
+        .arg(
+            clap::Arg::with_name("play_locally")
+                .short("p")
+                .long("play-locally")
+                .takes_value(false)
+                .help("Replay captured audio locally to the default alsa device"),
+        )
+        .arg(
+            clap::Arg::with_name("list_devices")
+                .short("l")
+                .long("-list-devices")
+                .takes_value(false)
+                .help("List alsa devices and exit"),
+        )
+        .arg(
+            clap::Arg::with_name("hw_name")
+                .short("d")
+                .long("alsa-aloop-device")
+                .takes_value(true)
+                .default_value("hw:3,1")
+                .help("Name of the alsa aloop device to listen audio from"),
+        )
+        .get_matches();
+
+    if matches.is_present("list_devices") {
+        list_alsa_devices()?;
+        return Ok(());
+    }
+
+    let should_play_locally = matches.is_present("play_locally");
+    let hw_name = matches.value_of("hw_name").unwrap();
 
     let params = alsa::Params {
         format: alsa::Format::FloatLe,
@@ -141,9 +191,7 @@ fn real_main() -> Result<(), Error> {
         rate: 44100,
     };
 
-    let hw_name = env::args().nth(1).unwrap_or_else(|| "hw:3,1".to_owned());
-
-    record(hw_name, params)?;
+    record(hw_name.to_owned(), params, should_play_locally)?;
 
     Ok(())
 }
